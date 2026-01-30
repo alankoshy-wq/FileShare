@@ -1,17 +1,18 @@
 import nodemailer from 'nodemailer';
+import { secrets } from './secrets.js';
 
 export async function sendShareEmail(recipientEmail: string, files: { name: string; url: string }[], shareLink?: string, message?: string) {
   const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
     port: parseInt(process.env.SMTP_PORT || '587'),
     secure: process.env.SMTP_SECURE === 'true',
     auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+      user: secrets.SMTP_USER,
+      pass: secrets.SMTP_PASS,
     },
   });
 
-  console.log(`[Email] Sending email from: ${process.env.SMTP_USER}`);
+  console.log(`[Email] Sending email from: ${secrets.SMTP_USER}`);
 
   const filesListHtml = files.map(file => `
         <div style="margin-bottom: 10px;">
@@ -21,7 +22,7 @@ export async function sendShareEmail(recipientEmail: string, files: { name: stri
     `).join('');
 
   const mailOptions = {
-    from: `"10xDS Transfer" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+    from: `"10xDS Transfer" <${process.env.SMTP_FROM || secrets.SMTP_USER}>`,
     to: recipientEmail,
     subject: `Files Shared: ${files.length} file${files.length > 1 ? 's' : ''}`,
     html: `
@@ -44,7 +45,7 @@ export async function sendShareEmail(recipientEmail: string, files: { name: stri
         </div>
         
         <p style="margin-top: 20px; font-size: 12px; color: #666;">
-          Links will expire in 1 hour.
+          Files are securely stored on Google Cloud.
         </p>
       </div>
     `,

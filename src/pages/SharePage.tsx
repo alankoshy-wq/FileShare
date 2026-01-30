@@ -22,6 +22,7 @@ const SharePage = () => {
     const [showPasswordDialog, setShowPasswordDialog] = useState(false);
     const [passwordError, setPasswordError] = useState("");
     const [isLocked, setIsLocked] = useState(false);
+    const [transferName, setTransferName] = useState("Shared Files");
     const { toast } = useToast();
 
     useEffect(() => {
@@ -57,6 +58,12 @@ const SharePage = () => {
 
                 const data = await response.json();
                 setFiles(data.files);
+
+                // Set page title and document title
+                const pageTitle = data.name || "Shared Files";
+                document.title = `${pageTitle} | SendShare`;
+                setTransferName(pageTitle);
+
                 setShowPasswordDialog(false);
                 setPasswordError("");
                 setIsLocked(false);
@@ -73,10 +80,40 @@ const SharePage = () => {
         }
     }, [id, password]);
 
+    const [downloadingFiles, setDownloadingFiles] = useState<Record<string, number>>({});
+    const [isDownloadingAll, setIsDownloadingAll] = useState(false);
+    const [downloadAllProgress, setDownloadAllProgress] = useState(0);
+
+    // ... (rest of useEffect)
+
     const handleDownload = async (file: TransferFile) => {
         try {
+            setDownloadingFiles(prev => ({ ...prev, [file.name]: 0 }));
+            toast({
+                title: "Download started",
+                description: `Downloading ${file.name}...`,
+            });
+
             const response = await fetch(file.url);
-            const blob = await response.blob();
+            if (!response.body) throw new Error("ReadableStream not yet supported in this browser.");
+
+            const contentLength = +response.headers.get('Content-Length')! || file.size;
+            const reader = response.body.getReader();
+
+            let receivedLength = 0;
+            const chunks = [];
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                chunks.push(value);
+                receivedLength += value.length;
+                const progress = (receivedLength / contentLength) * 100;
+                setDownloadingFiles(prev => ({ ...prev, [file.name]: progress }));
+            }
+
+            const blob = new Blob(chunks);
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -86,11 +123,23 @@ const SharePage = () => {
             window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
 
+            setDownloadingFiles(prev => {
+                const newState = { ...prev };
+                delete newState[file.name];
+                return newState;
+            });
+
             toast({
-                title: "Download started",
-                description: `Downloading ${file.name}...`,
+                title: "Download complete",
+                description: `${file.name} has been downloaded.`,
             });
         } catch (error) {
+            console.error(error);
+            setDownloadingFiles(prev => {
+                const newState = { ...prev };
+                delete newState[file.name];
+                return newState;
+            });
             toast({
                 title: "Download failed",
                 description: "Could not download file",
@@ -101,6 +150,13 @@ const SharePage = () => {
 
     const handleDownloadAll = async () => {
         try {
+            setIsDownloadingAll(true);
+            setDownloadAllProgress(0);
+            toast({
+                title: "Download started",
+                description: "Preparing zip file...",
+            });
+
             const headers: HeadersInit = {};
             if (password) {
                 headers['x-transfer-password'] = password;
@@ -111,8 +167,31 @@ const SharePage = () => {
             if (!response.ok) {
                 throw new Error('Failed to download zip');
             }
+            if (!response.body) throw new Error("ReadableStream not yet supported in this browser.");
 
-            const blob = await response.blob();
+            const contentLength = +response.headers.get('Content-Length')!;
+            // Note: Content-Length might not be available for chunked encoding, 
+            // but we can try to rely on it or just show spinner.
+
+            const reader = response.body.getReader();
+
+            let receivedLength = 0;
+            const chunks = [];
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                chunks.push(value);
+                receivedLength += value.length;
+
+                if (contentLength) {
+                    const progress = (receivedLength / contentLength) * 100;
+                    setDownloadAllProgress(progress);
+                }
+            }
+
+            const blob = new Blob(chunks);
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -122,11 +201,16 @@ const SharePage = () => {
             window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
 
+            setIsDownloadingAll(false);
+            setDownloadAllProgress(0);
             toast({
-                title: "Download started",
-                description: "Downloading all files as zip...",
+                title: "Download complete",
+                description: "Zip file downloaded successfully.",
             });
         } catch (error) {
+            console.error(error);
+            setIsDownloadingAll(false);
+            setDownloadAllProgress(0);
             toast({
                 title: "Download failed",
                 description: "Could not download files",
@@ -166,7 +250,7 @@ const SharePage = () => {
         <div className="min-h-screen bg-background p-4 md:p-8">
             <div className="max-w-3xl mx-auto space-y-8">
                 <div className="text-center space-y-2">
-                    <h1 className="text-3xl font-bold tracking-tight text-foreground">Shared Files</h1>
+                    <h1 className="text-3xl font-bold tracking-tight text-foreground">{transferName}</h1>
                     <p className="text-muted-foreground">
                         {files.length} file{files.length !== 1 ? 's' : ''} ready for download
                     </p>
@@ -176,9 +260,18 @@ const SharePage = () => {
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-4">
                         <CardTitle className="text-lg font-medium">Files</CardTitle>
                         {files.length > 1 && (
-                            <Button onClick={handleDownloadAll} variant="secondary" size="sm">
-                                <Download className="w-4 h-4 mr-2" />
-                                Download All
+                            <Button onClick={handleDownloadAll} variant="secondary" size="sm" disabled={isDownloadingAll}>
+                                {isDownloadingAll ? (
+                                    <>
+                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                        Downloading... {downloadAllProgress > 0 && `${Math.round(downloadAllProgress)}%`}
+                                    </>
+                                ) : (
+                                    <>
+                                        <Download className="w-4 h-4 mr-2" />
+                                        Download All
+                                    </>
+                                )}
                             </Button>
                         )}
                     </CardHeader>
@@ -217,10 +310,20 @@ const SharePage = () => {
                                     onClick={() => handleDownload(file)}
                                     variant="ghost"
                                     size="icon"
-                                    className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                                    className="shrink-0 transition-opacity"
                                     title="Download"
+                                    disabled={file.name in downloadingFiles}
                                 >
-                                    <Download className="w-4 h-4" />
+                                    {file.name in downloadingFiles ? (
+                                        <div className="relative flex items-center justify-center w-4 h-4">
+                                            <Loader2 className="w-4 h-4 animate-spin absolute" />
+                                            {downloadingFiles[file.name] > 0 && (
+                                                <span className="text-[8px] font-bold z-10">{Math.round(downloadingFiles[file.name])}</span>
+                                            )}
+                                        </div>
+                                    ) : (
+                                        <Download className="w-4 h-4 opacity-0 group-hover:opacity-100" />
+                                    )}
                                 </Button>
                             </div>
                         ))}

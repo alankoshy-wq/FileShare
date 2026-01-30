@@ -1,11 +1,22 @@
-import { BlobServiceClient, StorageSharedKeyCredential, generateBlobSASQueryParameters, BlobSASPermissions, SASProtocol } from '@azure/storage-blob';
+import fs from 'fs';
+import path from 'path';
 import bcrypt from 'bcryptjs';
+import { fileURLToPath } from 'url';
+// Setup local uploads directory
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// Go up one level from 'server' to root, then 'uploads'
+const UPLOADS_DIR = path.resolve(__dirname, '..', 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+export function getUploadsDir() {
+    return UPLOADS_DIR;
+}
 export async function storeTransferMetadata(transferId, password) {
-    const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
-    const containerName = 'uploads';
-    if (!accountName || !accountKey) {
-        throw new Error('Azure Storage credentials not found in environment variables');
+    const transferDir = path.join(UPLOADS_DIR, transferId);
+    if (!fs.existsSync(transferDir)) {
+        fs.mkdirSync(transferDir, { recursive: true });
     }
     // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
@@ -14,58 +25,28 @@ export async function storeTransferMetadata(transferId, password) {
         passwordHash,
         createdAt: new Date().toISOString()
     };
-    // Upload metadata as blob
-    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobServiceClient = new BlobServiceClient(`https://${accountName}.blob.core.windows.net`, sharedKeyCredential);
-    const containerClient = blobServiceClient.getContainerClient(containerName);
-    const blobName = `${transferId}/.metadata.json`;
-    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-    await blockBlobClient.upload(JSON.stringify(metadata), JSON.stringify(metadata).length, {
-        blobHTTPHeaders: { blobContentType: 'application/json' }
-    });
+    const metadataPath = path.join(transferDir, '.metadata.json');
+    await fs.promises.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
 }
 export async function getTransferMetadata(transferId) {
-    const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
-    const containerName = 'uploads';
-    if (!accountName || !accountKey) {
-        throw new Error('Azure Storage credentials not found in environment variables');
-    }
-    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobServiceClient = new BlobServiceClient(`https://${accountName}.blob.core.windows.net`, sharedKeyCredential);
-    const containerClient = blobServiceClient.getContainerClient(containerName);
-    const blobName = `${transferId}/.metadata.json`;
-    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+    const metadataPath = path.join(UPLOADS_DIR, transferId, '.metadata.json');
     try {
-        const downloadResponse = await blockBlobClient.download();
-        const downloaded = await streamToString(downloadResponse.readableStreamBody);
-        return JSON.parse(downloaded);
+        const content = await fs.promises.readFile(metadataPath, 'utf-8');
+        return JSON.parse(content);
     }
     catch (error) {
-        if (error.statusCode === 404) {
-            return null; // No metadata = no password protection
+        if (error.code === 'ENOENT') {
+            return null; // No metadata
         }
         throw error;
     }
 }
-async function streamToString(readableStream) {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        readableStream.on('data', (data) => {
-            chunks.push(data instanceof Buffer ? data : Buffer.from(data));
-        });
-        readableStream.on('end', () => {
-            resolve(Buffer.concat(chunks).toString('utf8'));
-        });
-        readableStream.on('error', reject);
-    });
-}
 export async function listFilesInTransfer(transferId, password) {
-    const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
-    const containerName = 'uploads'; // Assuming a fixed container for now
-    if (!accountName || !accountKey) {
-        throw new Error('Azure Storage credentials not found in environment variables');
+    const transferDir = path.join(UPLOADS_DIR, transferId);
+    if (!fs.existsSync(transferDir)) {
+        // Return empty if dir doesn't exist? Or throw 404? 
+        // Existing logic returned empty list or error. Let's return empty for now, or match behavior.
+        return [];
     }
     // Check if transfer is password protected
     const metadata = await getTransferMetadata(transferId);
@@ -84,35 +65,36 @@ export async function listFilesInTransfer(transferId, password) {
             throw error;
         }
     }
-    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobServiceClient = new BlobServiceClient(`https://${accountName}.blob.core.windows.net`, sharedKeyCredential);
-    const containerClient = blobServiceClient.getContainerClient(containerName);
-    const files = [];
-    // List blobs with the transferId prefix
-    for await (const blob of containerClient.listBlobsFlat({ prefix: `${transferId}/` })) {
-        // Skip metadata file
-        if (blob.name.endsWith('.metadata.json')) {
-            continue;
+    // Recursive function to get all files
+    async function getFilesRecursively(dir, baseDir) {
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        let files = [];
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            const relativePath = path.relative(baseDir, fullPath);
+            if (entry.isDirectory()) {
+                const subFiles = await getFilesRecursively(fullPath, baseDir);
+                files = files.concat(subFiles);
+            }
+            else if (entry.isFile()) {
+                // Skip metadata file and hidden files
+                if (entry.name === '.metadata.json' || entry.name.startsWith('.')) {
+                    continue;
+                }
+                const stats = await fs.promises.stat(fullPath);
+                // Construct URL with relative path
+                // relativePath might contain backslashes on Windows, need to normalize to forward slashes for URL
+                const normalizedPath = relativePath.split(path.sep).join('/');
+                const url = `/api/download/${transferId}/${encodeURIComponent(normalizedPath)}`;
+                files.push({
+                    name: normalizedPath, // Use relative path as name for display (e.g. "folder/file.txt")
+                    url: url,
+                    size: stats.size,
+                    contentType: 'application/octet-stream'
+                });
+            }
         }
-        // Generate Read SAS Token for each file
-        const sasOptions = {
-            containerName,
-            blobName: blob.name,
-            permissions: BlobSASPermissions.parse("r"),
-            startsOn: new Date(),
-            expiresOn: new Date(new Date().valueOf() + 24 * 3600 * 1000), // 24 hours
-            protocol: SASProtocol.HttpsAndHttp
-        };
-        const sasToken = generateBlobSASQueryParameters(sasOptions, sharedKeyCredential).toString();
-        const url = `https://${accountName}.blob.core.windows.net/${containerName}/${blob.name}?${sasToken}`;
-        // Extract original filename from the blob path (transferId/filename)
-        const name = blob.name.split('/').slice(1).join('/');
-        files.push({
-            name,
-            url,
-            size: blob.properties.contentLength,
-            contentType: blob.properties.contentType
-        });
+        return files;
     }
-    return files;
+    return await getFilesRecursively(transferDir, transferDir);
 }

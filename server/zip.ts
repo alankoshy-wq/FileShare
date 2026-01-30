@@ -1,8 +1,7 @@
 import path from 'path';
 import archiver from 'archiver';
 import { Response } from 'express';
-import { Readable } from 'stream';
-import { listFilesInTransfer } from './storage.js';
+import { listFilesInTransfer, getBucket } from './storage.js';
 
 export async function streamZip(transferId: string, password: string | undefined, res: Response) {
     try {
@@ -38,7 +37,6 @@ export async function streamZip(transferId: string, password: string | undefined
             if (err.code === 'ENOENT') {
                 console.warn('Archiver warning:', err);
             } else {
-                // throw error
                 throw err;
             }
         });
@@ -56,18 +54,23 @@ export async function streamZip(transferId: string, password: string | undefined
         // pipe archive data to the response
         archive.pipe(res);
 
+        const bucket = getBucket();
+
         // Fetch each file and append to archive
         for (const file of files) {
-            const response = await fetch(file.url);
-            if (!response.ok || !response.body) {
-                console.warn(`Failed to fetch file ${file.name} for zip`);
-                continue;
-            }
+            // Reconstruct the full GCS path
+            // file.name is the relative path "folder/subfolder/file.txt"
+            const gcsPath = `${transferId}/${file.name}`;
 
-            // Convert Web Stream to Node Readable Stream
-            // @ts-ignore - Readable.fromWeb is available in Node 18+
-            const nodeStream = Readable.fromWeb(response.body as any);
-            archive.append(nodeStream, { name: file.name });
+            // Create a read stream from GCS
+            const gcsStream = bucket.file(gcsPath).createReadStream();
+
+            // Handle stream errors so they don't crash everything?
+            gcsStream.on('error', (err) => {
+                console.error(`Error streaming file ${file.name} from GCS:`, err);
+            });
+
+            archive.append(gcsStream, { name: file.name });
         }
 
         await archive.finalize();

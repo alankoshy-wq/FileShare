@@ -10,7 +10,9 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+dist-server
 *.local
+uploads
 
 # Environment variables
 .env
@@ -25,3 +27,5 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.sendshare-key.json
+sendshare-key.json

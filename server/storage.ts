@@ -1,114 +1,106 @@
-import { BlobServiceClient, StorageSharedKeyCredential, generateBlobSASQueryParameters, BlobSASPermissions, SASProtocol } from '@azure/storage-blob';
+import { Storage } from '@google-cloud/storage';
+import path from 'path';
 import bcrypt from 'bcryptjs';
+import dotenv from 'dotenv';
 
-interface TransferMetadata {
-    passwordHash: string;
-    createdAt: string;
+dotenv.config();
+
+import { db } from './db.js';
+import { secrets } from './secrets.js';
+
+const storage = new Storage();
+const bucketName = secrets.GCS_BUCKET_NAME;
+
+export function getBucket() {
+    if (!bucketName) {
+        throw new Error('GCS_BUCKET_NAME environment variable is not set');
+    }
+    return storage.bucket(bucketName);
 }
 
-export async function storeTransferMetadata(transferId: string, password: string) {
-    const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
-    const containerName = 'uploads';
+interface TransferMetadata {
+    passwordHash?: string;
+    createdAt: string;
+    name?: string;
+    sizeBytes?: number;
+    fileCount?: number;
+    creatorEmail?: string;
+}
 
-    if (!accountName || !accountKey) {
-        throw new Error('Azure Storage credentials not found in environment variables');
+export async function storeTransferMetadata(transferId: string, password?: string, name?: string, sizeBytes?: number, fileCount?: number, creatorEmail?: string) {
+    let passwordHash: string | undefined;
+    if (password) {
+        passwordHash = await bcrypt.hash(password, 10);
     }
 
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
+    const docRef = db.collection('transfers').doc(transferId);
 
-    // Create metadata object
-    const metadata: TransferMetadata = {
-        passwordHash,
-        createdAt: new Date().toISOString()
-    };
+    // Check if doc exists to merge or set default createdAt
+    const doc = await docRef.get();
+    let metadata: TransferMetadata = doc.exists ? (doc.data() as TransferMetadata) : { createdAt: new Date().toISOString() };
 
-    // Upload metadata as blob
-    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobServiceClient = new BlobServiceClient(
-        `https://${accountName}.blob.core.windows.net`,
-        sharedKeyCredential
-    );
+    if (passwordHash) {
+        metadata.passwordHash = passwordHash;
+    }
+    if (name) {
+        metadata.name = name;
+    }
+    if (sizeBytes !== undefined) {
+        metadata.sizeBytes = sizeBytes;
+    }
+    if (fileCount !== undefined) {
+        metadata.fileCount = fileCount;
+    }
+    if (creatorEmail) {
+        metadata.creatorEmail = creatorEmail;
+    }
 
-    const containerClient = blobServiceClient.getContainerClient(containerName);
-    const blobName = `${transferId}/.metadata.json`;
-    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-
-    await blockBlobClient.upload(
-        JSON.stringify(metadata),
-        JSON.stringify(metadata).length,
-        {
-            blobHTTPHeaders: { blobContentType: 'application/json' }
-        }
-    );
+    await docRef.set(metadata, { merge: true });
 }
 
 export async function getTransferMetadata(transferId: string): Promise<TransferMetadata | null> {
-    const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
-    const containerName = 'uploads';
+    // 1. Try Firestore First
+    const docRef = db.collection('transfers').doc(transferId);
+    const doc = await docRef.get();
 
-    if (!accountName || !accountKey) {
-        throw new Error('Azure Storage credentials not found in environment variables');
+    if (doc.exists) {
+        return doc.data() as TransferMetadata;
     }
 
-    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobServiceClient = new BlobServiceClient(
-        `https://${accountName}.blob.core.windows.net`,
-        sharedKeyCredential
-    );
-
-    const containerClient = blobServiceClient.getContainerClient(containerName);
-    const blobName = `${transferId}/.metadata.json`;
-    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-
+    // 2. Fallback to GCS (Backward Compatibility)
+    // If not in DB, check GCS. If found, we could migrate it on read, or just return it.
+    console.log(`Metadata for ${transferId} not found in Firestore, checking GCS...`);
+    const file = getBucket().file(`${transferId}/.metadata.json`);
     try {
-        const downloadResponse = await blockBlobClient.download();
-        const downloaded = await streamToString(downloadResponse.readableStreamBody!);
-        return JSON.parse(downloaded) as TransferMetadata;
-    } catch (error: any) {
-        if (error.statusCode === 404) {
-            return null; // No metadata = no password protection
-        }
-        throw error;
-    }
-}
+        const [exists] = await file.exists();
+        if (!exists) return null;
 
-async function streamToString(readableStream: NodeJS.ReadableStream): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const chunks: Buffer[] = [];
-        readableStream.on('data', (data) => {
-            chunks.push(data instanceof Buffer ? data : Buffer.from(data));
-        });
-        readableStream.on('end', () => {
-            resolve(Buffer.concat(chunks).toString('utf8'));
-        });
-        readableStream.on('error', reject);
-    });
+        const [content] = await file.download();
+        const data = JSON.parse(content.toString()) as TransferMetadata;
+
+        // Optional: Auto-migrate on read? 
+        // Let's do it for seamless transition without running full script
+        await docRef.set(data);
+        console.log(`Migrated ${transferId} to Firestore on read.`);
+
+        return data;
+    } catch (error) {
+        console.error('Error fetching metadata from GCS:', error);
+        return null;
+    }
 }
 
 export async function listFilesInTransfer(transferId: string, password?: string) {
-    const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
-    const containerName = 'uploads'; // Assuming a fixed container for now
-
-    if (!accountName || !accountKey) {
-        throw new Error('Azure Storage credentials not found in environment variables');
-    }
-
     // Check if transfer is password protected
     const metadata = await getTransferMetadata(transferId);
 
-    if (metadata) {
-        // Transfer is password protected
+    if (metadata && metadata.passwordHash) {
         if (!password) {
             const error: any = new Error('Password required');
             error.statusCode = 401;
             throw error;
         }
 
-        // Validate password
         const isValid = await bcrypt.compare(password, metadata.passwordHash);
         if (!isValid) {
             const error: any = new Error('Invalid password');
@@ -117,45 +109,34 @@ export async function listFilesInTransfer(transferId: string, password?: string)
         }
     }
 
-    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobServiceClient = new BlobServiceClient(
-        `https://${accountName}.blob.core.windows.net`,
-        sharedKeyCredential
-    );
+    const [files] = await getBucket().getFiles({ prefix: `${transferId}/` });
 
-    const containerClient = blobServiceClient.getContainerClient(containerName);
-    const files = [];
+    // Filter out metadata and map to response format
+    return files
+        .filter(file => !file.name.endsWith('.metadata.json'))
+        .map(file => {
+            // file.name is "transferId/path/to/file"
+            // we want relative path "path/to/file"
+            const relativePath = file.name.slice(transferId.length + 1);
 
-    // List blobs with the transferId prefix
-    for await (const blob of containerClient.listBlobsFlat({ prefix: `${transferId}/` })) {
-        // Skip metadata file
-        if (blob.name.endsWith('.metadata.json')) {
-            continue;
-        }
+            // Construct download URL pointing to our server proxy
+            // The proxy will then generate a signed URL
+            const url = `/api/download/${transferId}/${encodeURIComponent(relativePath)}`;
 
-        // Generate Read SAS Token for each file
-        const sasOptions = {
-            containerName,
-            blobName: blob.name,
-            permissions: BlobSASPermissions.parse("r"),
-            startsOn: new Date(),
-            expiresOn: new Date(new Date().valueOf() + 24 * 3600 * 1000), // 24 hours
-            protocol: SASProtocol.HttpsAndHttp
-        };
-
-        const sasToken = generateBlobSASQueryParameters(sasOptions, sharedKeyCredential).toString();
-        const url = `https://${accountName}.blob.core.windows.net/${containerName}/${blob.name}?${sasToken}`;
-
-        // Extract original filename from the blob path (transferId/filename)
-        const name = blob.name.split('/').slice(1).join('/');
-
-        files.push({
-            name,
-            url,
-            size: blob.properties.contentLength,
-            contentType: blob.properties.contentType
+            return {
+                name: relativePath,
+                url: url,
+                size: parseInt(file.metadata.size as string || '0'),
+                contentType: file.metadata.contentType || 'application/octet-stream'
+            };
         });
-    }
+}
 
-    return files;
+export async function deleteTransfer(transferId: string) {
+    const bucket = getBucket();
+    // Delete all files including metadata with the prefix
+    await bucket.deleteFiles({ prefix: `${transferId}/` });
+
+    // Delete from Firestore
+    await db.collection('transfers').doc(transferId).delete();
 }

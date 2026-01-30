@@ -1,3 +1,4 @@
+
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -5,7 +6,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Upload, FolderUp, Link2, Copy, Check, Loader2, ExternalLink, Minus } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { BlockBlobClient } from "@azure/storage-blob";
+import { useAuth } from "@/contexts/AuthContext";
+import { useUpload } from "@/contexts/UploadContext";
 
 interface FileWithRelativePath extends File {
   webkitRelativePath: string;
@@ -17,12 +19,13 @@ export const FileUploadCard = () => {
   const [message, setMessage] = useState("");
   const [password, setPassword] = useState("");
   const [shareableLink, setShareableLink] = useState("");
-  const [uploadedFilesList, setUploadedFilesList] = useState<{ name: string, url: string }[]>([]);
   const [linkCopied, setLinkCopied] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const { toast } = useToast();
 
-  const [uploadProgress, setUploadProgress] = useState("");
+  // Consuming global context
+  const { startUpload, isUploading, uploadProgress } = useUpload();
+
+  const { toast } = useToast();
+  const { token } = useAuth();
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -44,122 +47,19 @@ export const FileUploadCard = () => {
       return;
     }
 
-    setIsUploading(true);
-    setUploadProgress(`0/${files.length}`);
-    toast({
-      title: "Transfer initiated",
-      description: `Starting upload for ${files.length} file${files.length > 1 ? 's' : ''}...`,
-    });
-
+    // Start Global Upload
     try {
-      const transferId = crypto.randomUUID();
-      let completedCount = 0;
-
-      // Upload files in parallel
-      const uploadPromises = files.map(async (file) => {
-        try {
-          // 1. Get SAS Token from Backend
-          // Use webkitRelativePath if available to preserve folder structure
-          const relativePath = (file as FileWithRelativePath).webkitRelativePath;
-          const filePath = relativePath || file.name;
-          const blobName = `${transferId}/${filePath}`;
-
-          const response = await fetch(`http://localhost:3000/api/sas?file=${encodeURIComponent(blobName)}`);
-          if (!response.ok) {
-            throw new Error(`Failed to get upload permission for ${file.name}`);
-          }
-          const { sasTokenUrl } = await response.json();
-
-          // 2. Upload to Azure Blob Storage
-          const blockBlobClient = new BlockBlobClient(sasTokenUrl);
-          await blockBlobClient.uploadData(file);
-
-          // Update progress
-          completedCount++;
-          setUploadProgress(`${completedCount}/${files.length}`);
-
-          // 3. Return result
-          const publicUrl = sasTokenUrl.split('?')[0];
-          return { name: filePath, url: publicUrl };
-        } catch (error) {
-          console.error(`Error uploading ${file.name}:`, error);
-          throw error;
-        }
-      });
-
-      const uploadedFiles = await Promise.all(uploadPromises);
-
-      // Generate the single shareable link
-      const transferLink = `${window.location.origin}/share/${transferId}`;
-      setShareableLink(transferLink);
-
-      // We don't need the individual file list for links anymore, but we keep it for the email payload if needed
-      // However, for the UI, we just show the single link.
-      setUploadedFilesList([{ name: "Transfer Link", url: transferLink }]);
-
-      toast({
-        title: "Transfer complete!",
-        description: "All files uploaded successfully",
-      });
-
-      // 4. Send Email (if recipient provided)
-      if (recipientEmail) {
-        try {
-          await fetch('http://localhost:3000/api/send-email', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              recipientEmail,
-              files: uploadedFiles,
-              shareLink: transferLink,
-              message
-            })
-          });
-          toast({
-            title: "Email sent",
-            description: `Notification sent to ${recipientEmail}`,
-          });
-        } catch (emailError) {
-          console.error('Failed to send email:', emailError);
-          toast({
-            title: "Email failed",
-            description: "Could not send notification email",
-            variant: "destructive"
-          });
-        }
-      }
-
-      // 5. Lock transfer with password if provided
-      if (password && password.trim().length > 0) {
-        try {
-          await fetch(`http://localhost:3000/api/transfer/${transferId}/lock`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password })
-          });
-          toast({
-            title: "Transfer secured",
-            description: "Password protection enabled",
-          });
-        } catch (lockError) {
-          console.error('Failed to lock transfer:', lockError);
-          toast({
-            title: "Password protection failed",
-            description: "Transfer uploaded but password protection could not be enabled",
-            variant: "destructive"
-          });
-        }
+      const link = await startUpload(files, recipientEmail, message, password);
+      if (link) {
+        setShareableLink(link);
+        // Clear form
+        setFiles([]);
+        setRecipientEmail("");
+        setMessage("");
+        setPassword("");
       }
     } catch (error) {
-      console.error('Upload failed:', error);
-      toast({
-        title: "Upload failed",
-        description: "One or more files failed to upload. Please try again.",
-        variant: "destructive",
-      });
-    } finally {
-      setIsUploading(false);
-      setUploadProgress("");
+      console.error("Initiation failed", error);
     }
   };
 
@@ -215,7 +115,7 @@ export const FileUploadCard = () => {
         {files.length > 0 && (
           <div className="space-y-2">
             <p className="text-sm font-medium text-muted-foreground mb-2">Selected Files ({files.length})</p>
-            <div className="max-h-32 overflow-y-auto space-y-2 pr-2">
+            <div className="max-h-48 overflow-y-auto space-y-2 pr-2">
               {files.map((file, index) => {
                 const relativePath = (file as FileWithRelativePath).webkitRelativePath;
                 const displayName = relativePath || file.name;
@@ -305,42 +205,34 @@ export const FileUploadCard = () => {
           <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <Label className="text-sm font-medium flex items-center gap-2">
               <Link2 className="w-4 h-4" />
-              Shareable links
+              Shareable link
             </Label>
             <div className="space-y-2">
-              {uploadedFilesList.map((file, index) => (
-                <div key={index} className="flex gap-2 items-center">
-                  <Input
-                    value={file.url}
-                    readOnly
-                    className="bg-accent border-border font-mono text-sm"
-                  />
-                  <Button
-                    onClick={() => {
-                      navigator.clipboard.writeText(file.url);
-                      toast({
-                        title: "Link copied!",
-                        description: `Link for ${file.name} copied to clipboard`,
-                      });
-                    }}
-                    variant="outline"
-                    size="icon"
-                    className="shrink-0"
-                    title="Copy link"
-                  >
-                    <Copy className="w-4 h-4" />
-                  </Button>
-                  <Button
-                    onClick={() => window.open(file.url, '_blank')}
-                    variant="outline"
-                    size="icon"
-                    className="shrink-0"
-                    title="Download file"
-                  >
-                    <ExternalLink className="w-4 h-4" />
-                  </Button>
-                </div>
-              ))}
+              <div className="flex gap-2 items-center">
+                <Input
+                  value={shareableLink}
+                  readOnly
+                  className="bg-accent border-border font-mono text-sm"
+                />
+                <Button
+                  onClick={copyToClipboard}
+                  variant="outline"
+                  size="icon"
+                  className="shrink-0"
+                  title={linkCopied ? "Copied" : "Copy link"}
+                >
+                  {linkCopied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+                </Button>
+                <Button
+                  onClick={() => window.open(shareableLink, '_blank')}
+                  variant="outline"
+                  size="icon"
+                  className="shrink-0"
+                  title="Open link"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                </Button>
+              </div>
             </div>
           </div>
         )}
