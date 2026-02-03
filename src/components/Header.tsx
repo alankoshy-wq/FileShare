@@ -15,7 +15,7 @@ import {
 
 
 export const Header = () => {
-  const { user, logout } = useAuth();
+  const { user, logout, isLoading } = useAuth();
   const [isDeleteModalOpen, setIsDeleteModalOpen] = React.useState(false);
   const [isDeleting, setIsDeleting] = React.useState(false);
 
@@ -50,66 +50,73 @@ export const Header = () => {
             </Link>
 
             <div className="flex items-center gap-4">
-              {user ? (
-                <div className="flex items-center gap-4">
-                  <Link
-                    to="/dashboard"
-                    className="text-sm font-medium hidden sm:block px-4 py-2 rounded-md border border-transparent bg-secondary hover:bg-purple-50 hover:border-purple-300 transition-all mr-2"
-                  >
-                    My Transfers
-                  </Link>
-                  <DropdownMenu modal={false}>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" className="flex items-center gap-2">
-                        {user.name}
-                        <ChevronDown className="h-4 w-4 opacity-50" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" className="w-56">
-                      <DropdownMenuLabel>
-                        <div className="flex flex-col space-y-1">
-                          <p className="text-sm font-medium leading-none">Name: {user.name}</p>
-                          <p className="text-xs leading-none text-muted-foreground">
-                            Email: {user.email}
-                          </p>
-                        </div>
-                      </DropdownMenuLabel>
-                      <DropdownMenuSeparator />
+              <div className="flex items-center gap-4">
+                {isLoading ? (
+                  <div className="flex items-center gap-2 animate-pulse">
+                    <div className="h-9 w-20 bg-secondary rounded-md" />
+                    <div className="h-9 w-24 bg-primary/10 rounded-md" />
+                  </div>
+                ) : user ? (
+                  <div className="flex items-center gap-4">
+                    <Link
+                      to="/dashboard"
+                      className="text-sm font-medium hidden sm:block px-4 py-2 rounded-md border border-transparent bg-secondary hover:bg-purple-50 hover:border-purple-300 transition-all mr-2"
+                    >
+                      My Transfers
+                    </Link>
+                    <DropdownMenu modal={false}>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" className="flex items-center gap-2">
+                          {user.name}
+                          <ChevronDown className="h-4 w-4 opacity-50" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-56">
+                        <DropdownMenuLabel>
+                          <div className="flex flex-col space-y-1">
+                            <p className="text-sm font-medium leading-none">Name: {user.name}</p>
+                            <p className="text-xs leading-none text-muted-foreground">
+                              Email: {user.email}
+                            </p>
+                          </div>
+                        </DropdownMenuLabel>
+                        <DropdownMenuSeparator />
 
-                      {user.role === 'admin' && (
-                        <>
-                          <DropdownMenuItem onClick={() => window.location.href = '/admin'} className="cursor-pointer font-semibold">
-                            <ShieldAlert className="mr-2 h-4 w-4 text-primary" />
-                            <span>Admin Dashboard</span>
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                        </>
-                      )}
+                        {user.role === 'admin' && (
+                          <>
+                            <DropdownMenuItem onClick={() => window.location.href = '/admin'} className="cursor-pointer font-semibold">
+                              <ShieldAlert className="mr-2 h-4 w-4 text-primary" />
+                              <span>Admin Dashboard</span>
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                          </>
+                        )}
 
-                      <DropdownMenuItem
-                        onClick={() => setIsDeleteModalOpen(true)}
-                        className="text-destructive focus:text-destructive cursor-pointer"
-                      >
-                        <Trash2 className="mr-2 h-4 w-4" />
-                        <span>Delete Account</span>
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={logout} className="cursor-pointer">
-                        <LogOut className="mr-2 h-4 w-4" />
-                        <span>Log out</span>
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <Link to="/login">
-                    <Button variant="ghost">Login</Button>
-                  </Link>
-                  <Link to="/register">
-                    <Button>Get Started</Button>
-                  </Link>
-                </div>
-              )}
+                        <DropdownMenuItem
+                          onClick={() => setIsDeleteModalOpen(true)}
+                          className="text-destructive focus:text-destructive cursor-pointer"
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" />
+                          <span>Delete Account</span>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={logout} className="cursor-pointer">
+                          <LogOut className="mr-2 h-4 w-4" />
+                          <span>Log out</span>
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 transition-opacity duration-300 ease-in">
+                    <Link to="/login">
+                      <Button variant="ghost">Login</Button>
+                    </Link>
+                    <Link to="/register">
+                      <Button>Get Started</Button>
+                    </Link>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>

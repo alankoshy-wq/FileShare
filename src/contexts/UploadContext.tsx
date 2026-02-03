@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 interface UploadContextType {
     isUploading: boolean;
     uploadProgress: string;
+    uploadPercentage: number;
     files: File[];
     startUpload: (files: File[], email?: string, message?: string, password?: string) => Promise<string | void>;
     cancelUpload: () => void;
@@ -16,25 +17,41 @@ const UploadContext = createContext<UploadContextType | undefined>(undefined);
 export function UploadProvider({ children }: { children: React.ReactNode }) {
     const [isUploading, setIsUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState("");
+    const [uploadPercentage, setUploadPercentage] = useState(0);
     const [files, setFiles] = useState<File[]>([]);
 
     // We can use a ref to store the abort controller if we want to support cancellation
+    // For XHR we need to store the requests
+    const xhrRefs = useRef<XMLHttpRequest[]>([]);
     const abortControllerRef = useRef<AbortController | null>(null);
 
     const startUpload = async (filesToUpload: File[], recipientEmail?: string, message?: string, password?: string) => {
         setIsUploading(true);
         setFiles(filesToUpload);
         setUploadProgress(`0/${filesToUpload.length}`);
+        setUploadPercentage(0);
         const token = localStorage.getItem('token');
 
+        // We still use AbortController for the non-XHR parts (tokens, finalize, etc)
         abortControllerRef.current = new AbortController();
         const signal = abortControllerRef.current.signal;
+        xhrRefs.current = [];
 
         try {
             const transferId = uuidv4();
             let completedCount = 0;
+            const totalSize = filesToUpload.reduce((acc, file) => acc + file.size, 0);
 
-            const uploadPromises = filesToUpload.map(async (file) => {
+            // Track progress per file
+            const fileProgress = new Array(filesToUpload.length).fill(0);
+
+            const updateAggregateProgress = () => {
+                const totalLoaded = fileProgress.reduce((acc, curr) => acc + curr, 0);
+                const percentage = totalSize > 0 ? (totalLoaded / totalSize) * 100 : 0;
+                setUploadPercentage(Math.min(percentage, 100)); // Cap at 100
+            };
+
+            const uploadPromises = filesToUpload.map(async (file, index) => {
                 if (signal.aborted) throw new Error('Upload cancelled');
 
                 // 1. Get SAS Token
@@ -46,22 +63,45 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
                 if (!sasRes.ok) throw new Error(`Failed to get upload permission for ${file.name}`);
                 const { sasTokenUrl } = await sasRes.json();
 
-                // 2. Upload to GCS
-                const uploadRes = await fetch(sasTokenUrl, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': contentType },
-                    body: file,
-                    signal
+                // 2. Upload to GCS using XHR
+                return new Promise<{ name: string, url: string }>((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhrRefs.current.push(xhr);
+
+                    xhr.open('PUT', sasTokenUrl);
+                    xhr.setRequestHeader('Content-Type', contentType);
+
+                    xhr.upload.onprogress = (event) => {
+                        if (event.lengthComputable) {
+                            fileProgress[index] = event.loaded;
+                            updateAggregateProgress();
+                        }
+                    };
+
+                    xhr.onload = () => {
+                        if (xhr.status >= 200 && xhr.status < 300) {
+                            completedCount++;
+                            setUploadProgress(`${completedCount}/${filesToUpload.length}`);
+                            // Ensure this file counts as fully loaded
+                            fileProgress[index] = file.size;
+                            updateAggregateProgress();
+                            resolve({ name: relativePath, url: sasTokenUrl });
+                        } else {
+                            reject(new Error(`Failed to upload ${file.name}`));
+                        }
+                    };
+
+                    xhr.onerror = () => reject(new Error(`Network error uploading ${file.name}`));
+                    xhr.onabort = () => reject(new Error('Upload cancelled'));
+
+                    xhr.send(file);
                 });
-
-                if (!uploadRes.ok) throw new Error(`Failed to upload ${file.name}`);
-
-                completedCount++;
-                setUploadProgress(`${completedCount}/${filesToUpload.length}`);
-                return { name: relativePath, url: sasTokenUrl };
             });
 
             await Promise.all(uploadPromises);
+
+            // Ensure 100% at the end
+            setUploadPercentage(100);
 
             // 3. Finalize
             let transferName = "Untitled Transfer";
@@ -69,8 +109,6 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
                 const first = filesToUpload[0].name;
                 transferName = filesToUpload.length === 1 ? first : `${first} + ${filesToUpload.length - 1} others`;
             }
-
-            const totalSize = filesToUpload.reduce((acc, file) => acc + file.size, 0);
 
             await fetch(`/api/transfer/${transferId}/finalize`, {
                 method: 'POST',
@@ -128,7 +166,7 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
             return transferLink;
 
         } catch (error: any) {
-            if (error.name === 'AbortError') {
+            if (error.name === 'AbortError' || error.message === 'Upload cancelled') {
                 toast.info("Upload cancelled");
             } else {
                 console.error("Upload failed", error);
@@ -137,8 +175,10 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
         } finally {
             setIsUploading(false);
             setUploadProgress("");
+            setUploadPercentage(0);
             setFiles([]);
             abortControllerRef.current = null;
+            xhrRefs.current = [];
         }
     };
 
@@ -146,10 +186,11 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
         }
+        xhrRefs.current.forEach(xhr => xhr.abort());
     };
 
     return (
-        <UploadContext.Provider value={{ isUploading, uploadProgress, files, startUpload, cancelUpload }}>
+        <UploadContext.Provider value={{ isUploading, uploadProgress, uploadPercentage, files, startUpload, cancelUpload }}>
             {children}
         </UploadContext.Provider>
     );

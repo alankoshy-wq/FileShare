@@ -1,63 +1,80 @@
-import fs from 'fs';
-import path from 'path';
+import { Storage } from '@google-cloud/storage';
 import bcrypt from 'bcryptjs';
-import { fileURLToPath } from 'url';
-// Setup local uploads directory
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-// Go up one level from 'server' to root, then 'uploads'
-const UPLOADS_DIR = path.resolve(__dirname, '..', 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-}
-export function getUploadsDir() {
-    return UPLOADS_DIR;
-}
-export async function storeTransferMetadata(transferId, password) {
-    const transferDir = path.join(UPLOADS_DIR, transferId);
-    if (!fs.existsSync(transferDir)) {
-        fs.mkdirSync(transferDir, { recursive: true });
+import dotenv from 'dotenv';
+dotenv.config();
+import { db } from './db.js';
+import { secrets } from './secrets.js';
+const storage = new Storage();
+const bucketName = secrets.GCS_BUCKET_NAME;
+export function getBucket() {
+    if (!bucketName) {
+        throw new Error('GCS_BUCKET_NAME environment variable is not set');
     }
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
-    // Create metadata object
-    const metadata = {
-        passwordHash,
-        createdAt: new Date().toISOString()
-    };
-    const metadataPath = path.join(transferDir, '.metadata.json');
-    await fs.promises.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+    return storage.bucket(bucketName);
+}
+export async function storeTransferMetadata(transferId, password, name, sizeBytes, fileCount, creatorEmail) {
+    let passwordHash;
+    if (password) {
+        passwordHash = await bcrypt.hash(password, 10);
+    }
+    const docRef = db.collection('transfers').doc(transferId);
+    // Check if doc exists to merge or set default createdAt
+    const doc = await docRef.get();
+    let metadata = doc.exists ? doc.data() : { createdAt: new Date().toISOString() };
+    if (passwordHash) {
+        metadata.passwordHash = passwordHash;
+    }
+    if (name) {
+        metadata.name = name;
+    }
+    if (sizeBytes !== undefined) {
+        metadata.sizeBytes = sizeBytes;
+    }
+    if (fileCount !== undefined) {
+        metadata.fileCount = fileCount;
+    }
+    if (creatorEmail) {
+        metadata.creatorEmail = creatorEmail;
+    }
+    await docRef.set(metadata, { merge: true });
 }
 export async function getTransferMetadata(transferId) {
-    const metadataPath = path.join(UPLOADS_DIR, transferId, '.metadata.json');
+    // 1. Try Firestore First
+    const docRef = db.collection('transfers').doc(transferId);
+    const doc = await docRef.get();
+    if (doc.exists) {
+        return doc.data();
+    }
+    // 2. Fallback to GCS (Backward Compatibility)
+    // If not in DB, check GCS. If found, we could migrate it on read, or just return it.
+    console.log(`Metadata for ${transferId} not found in Firestore, checking GCS...`);
+    const file = getBucket().file(`${transferId}/.metadata.json`);
     try {
-        const content = await fs.promises.readFile(metadataPath, 'utf-8');
-        return JSON.parse(content);
+        const [exists] = await file.exists();
+        if (!exists)
+            return null;
+        const [content] = await file.download();
+        const data = JSON.parse(content.toString());
+        // Optional: Auto-migrate on read? 
+        // Let's do it for seamless transition without running full script
+        await docRef.set(data);
+        console.log(`Migrated ${transferId} to Firestore on read.`);
+        return data;
     }
     catch (error) {
-        if (error.code === 'ENOENT') {
-            return null; // No metadata
-        }
-        throw error;
+        console.error('Error fetching metadata from GCS:', error);
+        return null;
     }
 }
 export async function listFilesInTransfer(transferId, password) {
-    const transferDir = path.join(UPLOADS_DIR, transferId);
-    if (!fs.existsSync(transferDir)) {
-        // Return empty if dir doesn't exist? Or throw 404? 
-        // Existing logic returned empty list or error. Let's return empty for now, or match behavior.
-        return [];
-    }
     // Check if transfer is password protected
     const metadata = await getTransferMetadata(transferId);
-    if (metadata) {
-        // Transfer is password protected
+    if (metadata && metadata.passwordHash) {
         if (!password) {
             const error = new Error('Password required');
             error.statusCode = 401;
             throw error;
         }
-        // Validate password
         const isValid = await bcrypt.compare(password, metadata.passwordHash);
         if (!isValid) {
             const error = new Error('Invalid password');
@@ -65,36 +82,29 @@ export async function listFilesInTransfer(transferId, password) {
             throw error;
         }
     }
-    // Recursive function to get all files
-    async function getFilesRecursively(dir, baseDir) {
-        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-        let files = [];
-        for (const entry of entries) {
-            const fullPath = path.join(dir, entry.name);
-            const relativePath = path.relative(baseDir, fullPath);
-            if (entry.isDirectory()) {
-                const subFiles = await getFilesRecursively(fullPath, baseDir);
-                files = files.concat(subFiles);
-            }
-            else if (entry.isFile()) {
-                // Skip metadata file and hidden files
-                if (entry.name === '.metadata.json' || entry.name.startsWith('.')) {
-                    continue;
-                }
-                const stats = await fs.promises.stat(fullPath);
-                // Construct URL with relative path
-                // relativePath might contain backslashes on Windows, need to normalize to forward slashes for URL
-                const normalizedPath = relativePath.split(path.sep).join('/');
-                const url = `/api/download/${transferId}/${encodeURIComponent(normalizedPath)}`;
-                files.push({
-                    name: normalizedPath, // Use relative path as name for display (e.g. "folder/file.txt")
-                    url: url,
-                    size: stats.size,
-                    contentType: 'application/octet-stream'
-                });
-            }
-        }
-        return files;
-    }
-    return await getFilesRecursively(transferDir, transferDir);
+    const [files] = await getBucket().getFiles({ prefix: `${transferId}/` });
+    // Filter out metadata and map to response format
+    return files
+        .filter(file => !file.name.endsWith('.metadata.json'))
+        .map(file => {
+        // file.name is "transferId/path/to/file"
+        // we want relative path "path/to/file"
+        const relativePath = file.name.slice(transferId.length + 1);
+        // Construct download URL pointing to our server proxy
+        // The proxy will then generate a signed URL
+        const url = `/api/download/${transferId}/${encodeURIComponent(relativePath)}`;
+        return {
+            name: relativePath,
+            url: url,
+            size: parseInt(file.metadata.size || '0'),
+            contentType: file.metadata.contentType || 'application/octet-stream'
+        };
+    });
+}
+export async function deleteTransfer(transferId) {
+    const bucket = getBucket();
+    // Delete all files including metadata with the prefix
+    await bucket.deleteFiles({ prefix: `${transferId}/` });
+    // Delete from Firestore
+    await db.collection('transfers').doc(transferId).delete();
 }

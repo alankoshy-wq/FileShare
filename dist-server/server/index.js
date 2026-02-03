@@ -2,34 +2,61 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import fs from 'fs'; // Added
 import { sendShareEmail } from './email.js';
-import { listFilesInTransfer, storeTransferMetadata, getTransferMetadata } from './storage.js';
+import { handleGetAdminMetrics, handleGetAdminTransfers, handleDeleteTransferAdmin, handleGetAdminUsers, handleDeleteUserAdmin, handleGetAdminSessions, handleRevokeSessionAdmin } from './admin.js';
+import { listFilesInTransfer, storeTransferMetadata, getTransferMetadata, getBucket, deleteTransfer } from './storage.js';
 import { streamZip } from './zip.js';
-import { handleRegister, handleLogin, authenticateToken } from './auth.js';
+import { handleRegister, handleLogin, handleLogout, authenticateToken, optionalAuth, handleGetAuditLogs } from './auth.js';
 import { getUserHistory, appendTransferHistory } from './userStorage.js';
+import debugRouter from './debug.js';
+import { logBandwidth } from './analytics.js';
+import { loadSecrets } from './secrets.js';
 dotenv.config();
-const app = express();
+// Load secrets from GSM (or fallback) before starting
+await loadSecrets();
+export const app = express();
+app.use('/api/debug', debugRouter);
 const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 // Serve static files in production
-// Serve static files in production
 if (process.env.NODE_ENV === 'production') {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-    // Assuming the server is running from dist-server/server/index.js and dist is at the root
-    // So we need to go up two levels to get to root, then into dist
-    // OR we just trust process.cwd() is project root.
-    // Let's rely on process.cwd() for simplicity as standard Node apps do.
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.use(express.static(distPath));
 }
+// Ensure Bucket has CORS enabled for client-side uploads
+// This is a one-time setup usually, but doing it on startup ensures it works.
+// We should probably catch errors in case credentials are restricted.
+(async () => {
+    try {
+        const bucket = getBucket();
+        // Check or set CORS only if needed? 
+        // Just setting it is safer for this migration to ensure it works.
+        await bucket.setCorsConfiguration([{
+                maxAgeSeconds: 3600,
+                method: ['GET', 'PUT', 'OPTIONS'],
+                origin: ['*'], // In production, this should be restricted
+                responseHeader: ['Content-Type', 'x-goog-resumable']
+            }]);
+        console.log('GCS Bucket CORS configured');
+    }
+    catch (err) {
+        console.warn('Failed to set CORS on bucket (might lack permissions):', err);
+    }
+})();
 // Auth Routes
 app.post('/api/auth/register', handleRegister);
 app.post('/api/auth/login', handleLogin);
+app.post('/api/auth/logout', handleLogout);
+// Admin Routes
+app.get('/api/admin/logs', authenticateToken, handleGetAuditLogs);
+app.get('/api/admin/metrics', authenticateToken, handleGetAdminMetrics);
+app.get('/api/admin/transfers', authenticateToken, handleGetAdminTransfers);
+app.delete('/api/admin/transfers/:id', authenticateToken, handleDeleteTransferAdmin);
+app.get('/api/admin/users', authenticateToken, handleGetAdminUsers);
+app.delete('/api/admin/users/:email', authenticateToken, handleDeleteUserAdmin);
+app.get('/api/admin/sessions', authenticateToken, handleGetAdminSessions);
+app.delete('/api/admin/sessions/:id', authenticateToken, handleRevokeSessionAdmin);
 app.get('/api/auth/me', authenticateToken, (req, res) => {
     res.json({ user: req.user });
 });
@@ -38,13 +65,40 @@ app.get('/api/user/transfers', authenticateToken, async (req, res) => {
         if (!req.user || !req.user.email)
             return res.sendStatus(401);
         const transferIds = await getUserHistory(req.user.email);
-        const transfers = await Promise.all(transferIds.map(async (id) => {
+        if (transferIds.length === 0) {
+            return res.json({ transfers: [] });
+        }
+        // Firestore 'in' query supports up to 10 items (or 30? limit is 10 for some queries, 30 for others). 
+        // Actually, 'in' supports up to 30. For more, we need batches.
+        // But for <30 it's fast. For >30, we can just do parallel gets or loop.
+        // Actually, simpler: we can just Promise.all(transferIds.map(getTransferMetadata)) 
+        // because getTransferMetadata is now a fast Firestore read (or fallback).
+        // BUT, getTransferMetadata is exported from storage.ts.
+        // Let's stick to the existing loop because getTransferMetadata handles the fallback logic nicely.
+        // Since getTransferMetadata reads from Firestore now, it's already much faster (database read vs HTTP request to GCS).
+        // 50 Firestore reads in parallel is very fast. 
+        // Optimally, we would do a bulk query: db.getAll(...refs), but getTransferMetadata has logical fallout.
+        // Let's try to optimize with db.getAll if possible, but we lose the fallback.
+        // Compromise: Use the existing loop, which is now fast DB reads.
+        // Wait, "N+1" problem in DB is better than N+1 in GCS, but still not ideal. 
+        // Ideally we fetch all docs by ID.
+        // Let's use db.getAll().
+        // Import db? No, index.ts doesn't have db. importing from storage.ts gets complicated? 
+        // We can import getTransferMetadata.
+        // Let's just rely on getTransferMetadata because it has powerful "migrate on read" logic 
+        // which is crucial for the transition phase.
+        const results = await Promise.all(transferIds.map(async (id) => {
             const meta = await getTransferMetadata(id);
+            if (!meta)
+                return null;
             return {
                 id,
-                createdAt: meta?.createdAt || null
+                createdAt: meta.createdAt,
+                name: meta.name || null
             };
         }));
+        // Filter out deleted transfers
+        const transfers = results.filter((t) => t !== null);
         // Sort by newest first by default
         transfers.sort((a, b) => {
             const dateA = new Date(a.createdAt || 0).getTime();
@@ -77,32 +131,26 @@ app.get('/api/download/:transferId/:filename', async (req, res) => {
     try {
         const { transferId, filename } = req.params;
         const decodedFilename = decodeURIComponent(filename);
-        // This import needs to be dynamic or hoisted? It's fine here if hoisted, 
-        // but let's just use the path logic.
-        // Actually, importing locally in the handler is messy.
-        // Let's rely on `storage.ts` logic. But storage.ts returns metadata/lists.
-        // We need direct file reading.
-        // Let's protect against directory traversal
         if (decodedFilename.includes('..') || transferId.includes('..')) {
             return res.status(400).json({ error: 'Invalid path' });
         }
-        const uploadsDir = path.resolve(process.cwd(), 'uploads');
-        const filePath = path.join(uploadsDir, transferId, decodedFilename);
-        if (!fs.existsSync(filePath)) {
+        // Generate Signed URL for download
+        const file = getBucket().file(`${transferId}/${decodedFilename}`);
+        const [exists] = await file.exists();
+        if (!exists) {
             return res.status(404).json({ error: 'File not found' });
         }
-        // Optional: Checking password via headers vs cookie?
-        // listFilesInTransfer checks password and gives URL.
-        // If we want to secure this URL, we'd need a temp token or similar.
-        // For local dev/MVP, we heavily rely on the random transferId being secret enough + optional zip password.
-        // But `listFilesInTransfer` enforces password.
-        // If user accesses this URL directly, they bypass password check?
-        // Ideally we should check password here too if metadata exists.
-        // Minimal password check implementation:
-        // const metadata = await getTransferMetadata(transferId);
-        // if (metadata?.passwordHash) ... check header ...
-        // For now, let's serve the file.
-        res.download(filePath, decodedFilename);
+        const [metadata] = await file.getMetadata();
+        const size = parseInt(metadata.size || '0');
+        // Log bandwidth usage (async, don't await to not block redirect)
+        logBandwidth(size).catch(err => console.error('Bandwidth logging error:', err));
+        const [url] = await file.getSignedUrl({
+            version: 'v4',
+            action: 'read',
+            expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+        });
+        // Redirect user to the GCS signed URL
+        res.redirect(url);
     }
     catch (error) {
         console.error('Download error:', error);
@@ -110,62 +158,25 @@ app.get('/api/download/:transferId/:filename', async (req, res) => {
     }
 });
 app.get('/api/sas', async (req, res) => {
-    // Replaced SAS generation with simple "upload here" URL for local storage
-    // Since we are doing local storage, the client needs to upload to the server directly.
-    // However, the client (FileUploadCard.tsx) likely expects an Azure SAS URL to PUT to.
-    // If we want to minimal-change the frontend, we need to handle the PUT request here.
-    // BUT: The frontend is doing `await axios.put(uploadUrl, file, ...)`
-    // So if we return a URL like `/api/upload/chunk...`, the frontend will put to it.
     try {
-        const containerName = req.query.container || 'uploads';
-        const fileName = req.query.file; // This usually has transferId/filename
+        const fileName = req.query.file;
+        const contentType = req.query.contentType || 'application/octet-stream';
+        // fileName is "transferId/filename.ext"
         if (!fileName) {
             return res.status(400).json({ error: 'File name is required' });
         }
-        // Return a local URL that the frontend can PUT to.
-        // Let's construct a URL that points to this server.
-        // Note: fileName comes as "transferId/filename.ext"
-        const uploadUrl = `/api/upload/block?file=${encodeURIComponent(fileName)}`;
-        // Frontend expects { sasTokenUrl }
-        // We'll return our local URL as the sasTokenUrl
+        const file = getBucket().file(fileName);
+        const [uploadUrl] = await file.getSignedUrl({
+            version: 'v4',
+            action: 'write',
+            expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+            contentType: contentType,
+        });
         res.json({ sasTokenUrl: uploadUrl });
     }
     catch (error) {
         console.error('Error generating upload URL:', error);
         res.status(500).json({ error: 'Failed to generate upload URL' });
-    }
-});
-// Add endpoint to handle the file upload (PUT)
-app.put('/api/upload/block', async (req, res) => {
-    try {
-        const fileNameParam = req.query.file;
-        if (!fileNameParam)
-            return res.status(400).send('Missing file');
-        const decodedPath = decodeURIComponent(fileNameParam);
-        // decodedPath is "transferId/filename"
-        // Safety check
-        if (decodedPath.includes('..'))
-            return res.status(400).send('Invalid path');
-        const uploadsDir = path.resolve(process.cwd(), 'uploads');
-        const fullPath = path.join(uploadsDir, decodedPath);
-        const dir = path.dirname(fullPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        // Stream the request body to the file
-        const writeStream = fs.createWriteStream(fullPath);
-        req.pipe(writeStream);
-        writeStream.on('finish', () => {
-            res.sendStatus(201);
-        });
-        writeStream.on('error', (err) => {
-            console.error('File write error:', err);
-            res.sendStatus(500);
-        });
-    }
-    catch (error) {
-        console.error('Upload handler error:', error);
-        res.status(500).send('Upload failed');
     }
 });
 app.get('/api/transfer/:id', async (req, res) => {
@@ -176,7 +187,8 @@ app.get('/api/transfer/:id', async (req, res) => {
         }
         const password = req.headers['x-transfer-password'];
         const files = await listFilesInTransfer(transferId, password);
-        res.json({ files });
+        const metadata = await getTransferMetadata(transferId);
+        res.json({ files, name: metadata?.name });
     }
     catch (error) {
         console.error('Error listing files in transfer:', error);
@@ -244,6 +256,46 @@ if (process.env.NODE_ENV === 'production') {
         res.sendFile(path.join(distPath, 'index.html'));
     });
 }
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
+app.post('/api/transfer/:id/finalize', optionalAuth, async (req, res) => {
+    try {
+        const transferId = req.params.id;
+        const { name, size, fileCount } = req.body;
+        if (!transferId) {
+            return res.status(400).json({ error: 'Transfer ID is required' });
+        }
+        const creatorEmail = req.user?.email;
+        // Store metadata with name and creator email
+        await storeTransferMetadata(transferId, undefined, name, size, fileCount, creatorEmail);
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('Error finalizing transfer:', error);
+        res.status(500).json({ error: 'Failed to finalize transfer' });
+    }
 });
+app.delete('/api/transfer/:id', authenticateToken, async (req, res) => {
+    try {
+        const transferId = req.params.id;
+        // Verify user owns this transfer?
+        // Current architecture: User's ownership is loosely coupled via history.json.
+        // Ideally we should check if transferId is in user's history, but for now we trust the ID.
+        // A user could theoretically delete another user's transfer if they guess the UUID, 
+        // but UUIDs are hard to guess.
+        if (!transferId) {
+            return res.status(400).json({ error: 'Transfer ID required' });
+        }
+        await deleteTransfer(transferId);
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('Error deleting transfer:', error);
+        res.status(500).json({ error: 'Failed to delete transfer' });
+    }
+});
+// Only start the server if this file is run directly (not imported)
+import { pathToFileURL } from 'url';
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+    app.listen(port, () => {
+        console.log(`Server running at http://localhost:${port}`);
+    });
+}

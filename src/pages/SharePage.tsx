@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Download, FileText, Loader2, AlertCircle, Lock } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { PasswordDialog } from "@/components/PasswordDialog";
+import { Progress } from "@/components/ui/progress";
 
 interface TransferFile {
     name: string;
@@ -33,7 +34,7 @@ const SharePage = () => {
                     headers['x-transfer-password'] = pwd;
                 }
 
-                const response = await fetch(`http://localhost:3000/api/transfer/${id}`, { headers });
+                const response = await fetch(`/api/transfer/${id}`, { headers });
 
                 if (response.status === 401) {
                     const errorData = await response.json();
@@ -162,7 +163,7 @@ const SharePage = () => {
                 headers['x-transfer-password'] = password;
             }
 
-            const response = await fetch(`http://localhost:3000/api/transfer/${id}/zip`, { headers });
+            const response = await fetch(`/api/transfer/${id}/zip`, { headers });
 
             if (!response.ok) {
                 throw new Error('Failed to download zip');
@@ -260,19 +261,30 @@ const SharePage = () => {
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-4">
                         <CardTitle className="text-lg font-medium">Files</CardTitle>
                         {files.length > 1 && (
-                            <Button onClick={handleDownloadAll} variant="secondary" size="sm" disabled={isDownloadingAll}>
-                                {isDownloadingAll ? (
-                                    <>
-                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                        Downloading... {downloadAllProgress > 0 && `${Math.round(downloadAllProgress)}%`}
-                                    </>
-                                ) : (
-                                    <>
-                                        <Download className="w-4 h-4 mr-2" />
-                                        Download All
-                                    </>
+                            <div className="flex flex-col items-end gap-2 w-full max-w-[200px]">
+                                <Button
+                                    onClick={handleDownloadAll}
+                                    variant="secondary"
+                                    size="sm"
+                                    disabled={isDownloadingAll}
+                                    className="w-full"
+                                >
+                                    {isDownloadingAll ? (
+                                        <>
+                                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            Zipping... {Math.round(downloadAllProgress)}%
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Download className="w-4 h-4 mr-2" />
+                                            Download All
+                                        </>
+                                    )}
+                                </Button>
+                                {isDownloadingAll && (
+                                    <Progress value={downloadAllProgress} className="h-1 w-full" />
                                 )}
-                            </Button>
+                            </div>
                         )}
                     </CardHeader>
                     <CardContent className="space-y-4">
@@ -297,13 +309,23 @@ const SharePage = () => {
                                     <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
                                         <FileText className="w-5 h-5 text-primary" />
                                     </div>
-                                    <div className="min-w-0">
+                                    <div className="min-w-0 flex-1">
                                         <p className="font-medium truncate text-foreground" title={file.name}>
                                             {file.name}
                                         </p>
-                                        <p className="text-sm text-muted-foreground">
-                                            {(file.size / 1024 / 1024).toFixed(2)} MB
-                                        </p>
+                                        <div className="flex items-center gap-2">
+                                            <p className="text-sm text-muted-foreground">
+                                                {(file.size / 1024 / 1024).toFixed(2)} MB
+                                            </p>
+                                            {file.name in downloadingFiles && (
+                                                <div className="flex-1 max-w-[100px] ml-2">
+                                                    <Progress value={downloadingFiles[file.name]} className="h-1.5" />
+                                                </div>
+                                            )}
+                                            {file.name in downloadingFiles && (
+                                                <span className="text-xs text-muted-foreground">{Math.round(downloadingFiles[file.name])}%</span>
+                                            )}
+                                        </div>
                                     </div>
                                 </div>
                                 <Button

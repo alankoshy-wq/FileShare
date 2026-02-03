@@ -25,11 +25,8 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Serve static files in production
-if (process.env.NODE_ENV === 'production') {
-    const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-}
+// Serve static files in production - REMOVED for Netlify
+// Netlify handles static assets directly.
 
 // Ensure Bucket has CORS enabled for client-side uploads
 // This is a one-time setup usually, but doing it on startup ensures it works.
@@ -280,13 +277,8 @@ app.get('/api/transfer/:id/zip', async (req, res) => {
     }
 });
 
-// Handle client-side routing in production
-if (process.env.NODE_ENV === 'production') {
-    app.get('*', (req, res) => {
-        const distPath = path.resolve(process.cwd(), 'dist');
-        res.sendFile(path.join(distPath, 'index.html'));
-    });
-}
+// Handle client-side routing in production - REMOVED for Netlify
+// Netlify redirects handle this via netlify.toml
 
 app.post('/api/transfer/:id/finalize', optionalAuth, async (req, res) => {
     try {
@@ -329,6 +321,12 @@ app.delete('/api/transfer/:id', authenticateToken, async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-});
+// Only listen if run directly (locally), not when imported by Netlify function
+import { pathToFileURL } from 'url';
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+    app.listen(port, () => {
+        console.log(`Server running at http://localhost:${port}`);
+    });
+}
+
+export { app };
