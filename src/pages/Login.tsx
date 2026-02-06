@@ -80,6 +80,14 @@ export default function Login() {
                                 value={password}
                                 onChange={(e) => setPassword(e.target.value)}
                             />
+                            <div className="text-right !mt-1">
+                                <Link
+                                    to="/forgot-password"
+                                    className="text-xs text-muted-foreground hover:text-primary hover:underline transition-colors"
+                                >
+                                    Forgot password?
+                                </Link>
+                            </div>
                         </div>
                     </CardContent>
                     <CardFooter className="flex flex-col gap-4">

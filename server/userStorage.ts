@@ -82,3 +82,8 @@ export async function deleteUser(email: string): Promise<void> {
     // Delete user profile
     await userRef.delete();
 }
+
+export async function updateUserPassword(email: string, passwordHash: string): Promise<void> {
+    const userRef = db.collection(USERS_COLLECTION).doc(email);
+    await userRef.update({ passwordHash });
+}

@@ -2,6 +2,15 @@ import nodemailer from 'nodemailer';
 import { secrets } from './secrets.js';
 
 export async function sendShareEmail(recipientEmail: string, files: { name: string; url: string }[], shareLink?: string, message?: string) {
+  // Dev Mode / No-Credentials Fallback
+  if (!secrets.SMTP_USER || !secrets.SMTP_PASS) {
+    console.warn("[Email] No SMTP credentials found. Mocking email send (Dev Mode).");
+    console.log(`[Email] To: ${recipientEmail}`);
+    console.log(`[Email] Subject: Files Shared: ${files.length} file(s)`);
+    if (shareLink) console.log(`[Email] Share Link: ${shareLink}`);
+    return;
+  }
+
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
     port: parseInt(process.env.SMTP_PORT || '587'),
@@ -53,6 +62,49 @@ export async function sendShareEmail(recipientEmail: string, files: { name: stri
 
   const info = await transporter.sendMail(mailOptions);
 
-  console.log("Message sent: %s", info.messageId);
   console.log("Preview URL: %s", nodemailer.getTestMessageUrl(info));
+}
+
+export async function sendResetPasswordEmail(recipientEmail: string, resetLink: string) {
+  // Dev Mode / No-Credentials Fallback
+  if (!secrets.SMTP_USER || !secrets.SMTP_PASS) {
+    console.warn("[Email] No SMTP credentials found. Mocking email send (Dev Mode).");
+    console.log(`[Email] To: ${recipientEmail}`);
+    console.log(`[Email] Reset Link: ${resetLink}`);
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: {
+      user: secrets.SMTP_USER,
+      pass: secrets.SMTP_PASS,
+    },
+  });
+
+  console.log(`[Email] Sending reset email to: ${recipientEmail}`);
+
+  const mailOptions = {
+    from: `"10xDS Security" <${process.env.SMTP_FROM || secrets.SMTP_USER}>`,
+    to: recipientEmail,
+    subject: `Reset Your Password`,
+    html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+          <h2 style="color: #333;">Reset Your Password</h2>
+          <p>You requested to reset your password for your 10xDS Transfer account.</p>
+          
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${resetLink}" style="display: inline-block; background-color: #6366f1; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 16px;">Reset Password</a>
+          </div>
+          
+          <p style="color: #666;">If you didn't ask for this, you can ignore this email.</p>
+          <p style="font-size: 12px; color: #999; margin-top: 30px;">Link expires in 15 minutes.</p>
+        </div>
+      `,
+  };
+
+  const info = await transporter.sendMail(mailOptions);
+  console.log("Reset email sent: %s", info.messageId);
 }

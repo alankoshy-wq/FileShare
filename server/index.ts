@@ -7,7 +7,7 @@ import { sendShareEmail } from './email.js';
 import { handleGetAdminMetrics, handleGetAdminTransfers, handleDeleteTransferAdmin, handleGetAdminUsers, handleDeleteUserAdmin, handleGetAdminSessions, handleRevokeSessionAdmin } from './admin.js';
 import { listFilesInTransfer, storeTransferMetadata, getTransferMetadata, getBucket, deleteTransfer } from './storage.js';
 import { streamZip } from './zip.js';
-import { handleRegister, handleLogin, handleLogout, authenticateToken, optionalAuth, handleDeleteAccount, handleGetAuditLogs } from './auth.js';
+import { handleRegister, handleLogin, handleLogout, authenticateToken, optionalAuth, handleDeleteAccount, handleGetAuditLogs, handleForgotPassword, handleResetPassword } from './auth.js';
 import { getUserHistory, appendTransferHistory } from './userStorage.js';
 import debugRouter from './debug.js';
 import { logBandwidth } from './analytics.js';
@@ -52,6 +52,8 @@ app.use(express.json());
 app.post('/api/auth/register', handleRegister);
 app.post('/api/auth/login', handleLogin);
 app.post('/api/auth/logout', handleLogout);
+app.post('/api/auth/forgot-password', handleForgotPassword);
+app.post('/api/auth/reset-password', handleResetPassword);
 // Admin Routes
 app.get('/api/admin/logs', authenticateToken, handleGetAuditLogs);
 app.get('/api/admin/metrics', authenticateToken, handleGetAdminMetrics);

@@ -2,7 +2,7 @@ import { Header } from "@/components/Header";
 import { FileUploadCard } from "@/components/FileUploadCard";
 import { HeroSection } from "@/components/HeroSection";
 
-const Index = () => {
+const Transfer = () => {
   return (
     <div className="min-h-screen bg-background">
       <Header />
@@ -50,4 +50,4 @@ const Index = () => {
   );
 };
 
-export default Index;
+export default Transfer;
