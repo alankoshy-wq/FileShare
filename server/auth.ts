@@ -40,23 +40,24 @@ export const authenticateToken = (req: Request, res: Response, next: NextFunctio
             }
         }
 
-        // Fetch fresh data from DB to ensure role is up-to-date
+        // Fetch fresh data from DB to ensure user exists and role is up-to-date
         try {
             const freshUser = await getUser(decodedUser.email);
-            if (freshUser) {
-                req.user = {
-                    email: freshUser.email,
-                    name: freshUser.name,
-                    role: freshUser.role
-                };
-            } else {
-                req.user = decodedUser;
+
+            if (!freshUser) {
+                // User account deleted or disabled
+                return res.sendStatus(401);
             }
+
+            req.user = {
+                email: freshUser.email,
+                name: freshUser.name,
+                role: freshUser.role
+            };
             next();
         } catch (error) {
             console.error("Error fetching fresh user in auth middleware", error);
-            req.user = decodedUser;
-            next();
+            return res.sendStatus(500);
         }
     });
 };
@@ -103,8 +104,13 @@ export async function handleRegister(req: Request, res: Response) {
         // Log Activity
         await logActivity(email, 'USER_REGISTER', { name }, undefined, req.ip);
 
-        // Generate token immediately (auto-login)
-        const token = jwt.sign({ email, name, role }, JWT_SECRET, { expiresIn: '7d' });
+        // Create Session for the new user
+        const userAgent = req.headers['user-agent'] || 'Unknown';
+        const ip = req.ip || 'Unknown';
+        const sessionId = await createSession(email, userAgent, ip);
+
+        // Generate token immediately (auto-login), including sessionId
+        const token = jwt.sign({ email, name, role, sessionId }, JWT_SECRET, { expiresIn: '7d' });
 
         res.status(201).json({ token, user: { email, name, role } });
     } catch (error: any) {
